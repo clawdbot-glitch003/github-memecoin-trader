@@ -40,6 +40,7 @@ const axios_1 = __importDefault(require("axios"));
 require("dotenv/config");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const ethers_1 = require("ethers");
 // ----------------------
 // Trade Logger (Local DB)
 // ----------------------
@@ -90,13 +91,17 @@ class PortfolioManager {
     canAfford(amountEth) {
         return this.state.cash_eth >= amountEth;
     }
-    recordBuy(symbol, address, amountEth, amountToken, priceEth) {
+    recordBuy(symbol, address, amountEth, amountToken, priceEth, poolAddress) {
         this.state.cash_eth -= amountEth;
         // Track position by address (unique key)
         if (!this.state.positions[address]) {
             this.state.positions[address] = { symbol, amount: 0, entry_price_eth: 0 };
         }
         const pos = this.state.positions[address];
+        // Store pool address if available and not set
+        if (poolAddress && !pos.pool_address) {
+            pos.pool_address = poolAddress;
+        }
         // Update weighted average entry price
         const totalValue = (pos.amount * pos.entry_price_eth) + (amountToken * priceEth);
         const totalAmount = pos.amount + amountToken;
@@ -124,6 +129,54 @@ class PortfolioManager {
     }
     getPositions() {
         return Object.entries(this.state.positions).map(([k, v]) => ({ address: k, ...v }));
+    }
+}
+// ----------------------
+// RPC Price Fetcher (Alchemy)
+// ----------------------
+class RpcPriceFetcher {
+    provider = null;
+    constructor() {
+        const apiKey = process.env.ALCHEMY_API_KEY;
+        if (apiKey) {
+            const url = `https://base-mainnet.g.alchemy.com/v2/${apiKey}`;
+            this.provider = new ethers_1.ethers.JsonRpcProvider(url);
+        }
+        else if (process.env.BASE_RPC_URL) {
+            this.provider = new ethers_1.ethers.JsonRpcProvider(process.env.BASE_RPC_URL);
+        }
+        else {
+            // console.warn('No Alchemy API Key or Base RPC URL provided. Price fetching will fail.');
+        }
+    }
+    isReady() {
+        return this.provider !== null;
+    }
+    // Returns Price of Token in ETH
+    async getPrice(poolAddress, tokenAddress) {
+        if (!this.provider)
+            return null;
+        try {
+            const poolContract = new ethers_1.ethers.Contract(poolAddress, [
+                'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+                'function token0() external view returns (address)'
+            ], this.provider);
+            // Fetch slot0 (containing price) and token0 (to determine direction)
+            const [sqrtPriceX96] = await poolContract.slot0();
+            const token0 = await poolContract.token0();
+            const isToken0 = tokenAddress.toLowerCase() === token0.toLowerCase();
+            const numerator = Number(sqrtPriceX96);
+            const denominator = 2 ** 96;
+            const ratio = (numerator / denominator) ** 2; // price of token0 in terms of token1
+            // if token is token0, price (in token1/ETH) = ratio
+            // if token is token1, price (in token0/ETH) = 1 / ratio
+            const priceInEth = isToken0 ? ratio : (1 / ratio);
+            return priceInEth;
+        }
+        catch (e) {
+            console.error(`[RPC] Price fetch failed for pool ${poolAddress}:`, e.message);
+            return null;
+        }
     }
 }
 // ----------------------
@@ -352,6 +405,7 @@ async function main() {
     const telegram = new TelegramNotifier();
     const logger = new TradeLogger();
     const portfolio = new PortfolioManager();
+    const rpc = new RpcPriceFetcher(); // Added
     const isDryRun = process.env.DRY_RUN === 'true';
     console.log(`Starting Memecoin Trader (Mode: ${isDryRun ? 'DRY RUN' : 'LIVE'})...`);
     if (process.env.ENABLE_TELEGRAM === 'true') {
@@ -367,11 +421,29 @@ async function main() {
             if (portfolioPositions.length > 0) {
                 console.log(`Checking ${portfolioPositions.length} positions for TP/SL...`);
                 for (const pos of portfolioPositions) {
-                    const tokenAmountWei = BigInt(Math.floor(pos.amount * 1e18)).toString();
-                    // Get SELL quote (Token -> ETH)
-                    const quote = await wallet.getSellQuote(pos.address, tokenAmountWei);
-                    if (quote) {
-                        const currentPrice = quote.price; // ETH per Token
+                    let currentPrice = 0;
+                    let ethAmount = 0;
+                    // 1. Try Direct RPC (Best for new Clanker tokens)
+                    if (rpc.isReady()) {
+                        const poolAddress = pos.pool_address;
+                        if (poolAddress) {
+                            const rpcPrice = await rpc.getPrice(poolAddress, pos.address);
+                            if (rpcPrice) {
+                                currentPrice = rpcPrice;
+                                ethAmount = pos.amount * currentPrice;
+                            }
+                        }
+                    }
+                    // 2. Fallback to Wallet Quote
+                    if (currentPrice === 0) {
+                        const tokenAmountWei = BigInt(Math.floor(pos.amount * 1e18)).toString();
+                        const quote = await wallet.getSellQuote(pos.address, tokenAmountWei);
+                        if (quote) {
+                            currentPrice = quote.price;
+                            ethAmount = quote.ethAmount;
+                        }
+                    }
+                    if (currentPrice > 0) {
                         const entryPrice = pos.entry_price_eth; // ETH per Token
                         const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
                         console.log(`  [Pos] ${pos.symbol}: Entry ${entryPrice.toFixed(9)} -> Current ${currentPrice.toFixed(9)} ETH (${pnlPercent.toFixed(2)}%)`);
@@ -383,9 +455,7 @@ async function main() {
                             action = 'sell_sl';
                         if (action) {
                             console.log(`  🚨 Triggering ${action === 'sell_tp' ? 'TAKE PROFIT' : 'STOP LOSS'} for ${pos.symbol}...`);
-                            // Simulating Sell for Portfolio
                             portfolio.recordSell(pos.address, pos.amount, currentPrice);
-                            // Log Trade
                             logger.log({
                                 timestamp: new Date().toISOString(),
                                 symbol: pos.symbol,
@@ -393,20 +463,20 @@ async function main() {
                                 source: 'portfolio',
                                 action: action,
                                 amount_token: pos.amount,
-                                amount_eth: quote.ethAmount,
+                                amount_eth: ethAmount || (pos.amount * currentPrice),
                                 price_eth: currentPrice,
                                 status: isDryRun ? 'simulated' : 'executed',
-                                repo: 'portfolio_manager', // Automated action
+                                repo: 'portfolio_manager',
                                 pnl_usd: 0
                             });
                             await telegram.sendMessage(`📉 *${action === 'sell_tp' ? 'Take Profit' : 'Stop Loss'} Executed*\n` +
                                 `Token: ${pos.symbol}\n` +
                                 `PnL: ${pnlPercent.toFixed(2)}%\n` +
                                 `Price: ${currentPrice.toFixed(9)} ETH\n` +
-                                `Proceeds: ${quote.ethAmount.toFixed(4)} ETH`);
+                                `Proceeds: ${((ethAmount || 0)).toFixed(4)} ETH`);
                         }
                     }
-                    // Rate limit check
+                    // Rate check
                     await new Promise(r => setTimeout(r, 1000));
                 }
             }
@@ -448,10 +518,23 @@ async function main() {
                     const result = await wallet.swap(bestMatch.contract_address, buyAmt);
                     if (result) {
                         const status = isDryRun ? 'simulated' : 'executed';
-                        const buyAmount = result.buyAmount || 0;
-                        const priceEth = result.price || 0;
+                        let buyAmount = result.buyAmount || 0;
+                        let priceEth = result.price || 0;
+                        // If quote failed (0 amount) but we have RPC and pool address
+                        if (buyAmount === 0 && rpc.isReady() && bestMatch.pool_address) {
+                            console.log(`  [RPC] Fetching real-time price from pool ${bestMatch.pool_address}...`);
+                            const rpcPrice = await rpc.getPrice(bestMatch.pool_address, bestMatch.contract_address);
+                            if (rpcPrice) {
+                                priceEth = rpcPrice;
+                                buyAmount = buyAmt / priceEth; // Estimate tokens received
+                                console.log(`  [RPC] Success! Price: ${priceEth.toFixed(9)} ETH. Est. Tokens: ${buyAmount.toFixed(2)}`);
+                            }
+                        }
                         if (buyAmount > 0) {
-                            portfolio.recordBuy(bestMatch.symbol, bestMatch.contract_address, buyAmt, buyAmount, priceEth);
+                            portfolio.recordBuy(bestMatch.symbol, bestMatch.contract_address, buyAmt, buyAmount, priceEth, bestMatch.pool_address);
+                        }
+                        else {
+                            console.log(`  [Warn] Failed to get price/amount for ${bestMatch.symbol}. Logging anyway but portfolio position will be empty.`);
                         }
                         logger.log({
                             timestamp: new Date().toISOString(),
