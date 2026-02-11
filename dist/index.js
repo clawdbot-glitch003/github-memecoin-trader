@@ -191,17 +191,32 @@ async function main() {
         // Search DexScreener for tokens matching the repo name
         const pairs = await marketScanner.searchToken(repo.name);
         if (pairs.length > 0) {
+            // Filter out pairs with missing liquidity
+            const validPairs = pairs.filter(p => p.liquidity && p.liquidity.usd > 0);
             // Sort by liquidity (highest first)
-            pairs.sort((a, b) => b.liquidity.usd - a.liquidity.usd);
-            const bestPair = pairs[0];
-            // Basic Safety Check: Minimum Liquidity $5k
-            if (bestPair.liquidity.usd < 5000) {
-                console.log(`  Skipping ${bestPair.baseToken.symbol}: Low liquidity ($${bestPair.liquidity.usd})`);
+            validPairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)); // Use optional chaining
+            if (validPairs.length === 0)
+                continue;
+            const bestPair = validPairs[0];
+            // Safety Checks
+            // 1. Minimum Liquidity $5k
+            if ((bestPair.liquidity?.usd || 0) < 5000) {
+                console.log(`  Skipping ${bestPair.baseToken.symbol}: Low liquidity ($${bestPair.liquidity?.usd})`);
+                continue;
+            }
+            // 2. Token Age Check (e.g., must be younger than 7 days to be "fresh")
+            // DexScreener might return pairCreatedAt in ms
+            const createdAt = bestPair.pairCreatedAt || Date.now();
+            const pairAgeMs = Date.now() - createdAt;
+            const pairAgeDays = pairAgeMs / (1000 * 60 * 60 * 24);
+            if (pairAgeDays > 7) {
+                console.log(`  Skipping ${bestPair.baseToken.symbol}: Too old (${pairAgeDays.toFixed(1)} days)`);
                 continue;
             }
             console.log(`  Found matching token for ${repo.name}: ${bestPair.baseToken.symbol} (${bestPair.baseToken.address})`);
-            console.log(`  Liquidity: $${bestPair.liquidity.usd}`);
+            console.log(`  Liquidity: $${bestPair.liquidity?.usd}`);
             console.log(`  FDV: $${bestPair.fdv}`);
+            console.log(`  Age: ${pairAgeDays.toFixed(1)} days`);
             const tokenInfo = {
                 address: bestPair.baseToken.address,
                 symbol: bestPair.baseToken.symbol,
@@ -210,8 +225,9 @@ async function main() {
             await telegram.sendMessage(`🔍 *Opportunity Found*\n` +
                 `Repo: [${repo.name}](${repo.html_url})\n` +
                 `Token: ${tokenInfo.symbol}\n` +
-                `Liquidity: $${bestPair.liquidity.usd.toLocaleString()}\n` +
-                `FDV: $${bestPair.fdv.toLocaleString()}\n` +
+                `Liquidity: $${bestPair.liquidity?.usd?.toLocaleString() || 'Unknown'}\n` +
+                `FDV: $${bestPair.fdv?.toLocaleString() || 'Unknown'}\n` +
+                `Age: ${pairAgeDays.toFixed(1)} days\n` +
                 `Address: \`${tokenInfo.address}\``);
             tokensToBuy.push(tokenInfo);
         }
