@@ -131,6 +131,12 @@ class VincentWallet {
     // 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE represents native ETH
     const sellToken = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
     
+    // Check if DRY_RUN is enabled
+    if (process.env.DRY_RUN === 'true') {
+      console.log(`[DRY RUN] Would swap ${amountInEth} ETH for ${tokenAddress}`);
+      return { status: 'simulated', txHash: '0x_simulated_hash' };
+    }
+
     try {
       console.log(`Attempting to swap ${amountInEth} ETH for ${tokenAddress}...`);
       
@@ -226,6 +232,38 @@ class MarketScanner {
 }
 
 // ----------------------
+// Telegram Notifier
+// ----------------------
+
+class TelegramNotifier {
+  private readonly botToken: string;
+  private readonly chatId: string;
+
+  constructor() {
+    this.botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+    this.chatId = process.env.TELEGRAM_CHAT_ID || '';
+  }
+
+  public async sendMessage(text: string): Promise<void> {
+    if (!this.botToken || !this.chatId) {
+      console.log('[Telegram] No credentials, skipping message:', text);
+      return;
+    }
+
+    try {
+      const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
+      await axios.post(url, {
+        chat_id: this.chatId,
+        text: text,
+        parse_mode: 'Markdown'
+      });
+    } catch (e: any) {
+      console.error('[Telegram] Failed to send message:', e.message);
+    }
+  }
+}
+
+// ----------------------
 // Main Application Logic
 // ----------------------
 
@@ -233,8 +271,12 @@ async function main() {
   const wallet = new VincentWallet();
   const githubScanner = new GitHubScanner();
   const marketScanner = new MarketScanner();
+  const telegram = new TelegramNotifier();
 
-  console.log('Starting Memecoin Trader (TypeScript Edition)...');
+  const isDryRun = process.env.DRY_RUN === 'true';
+
+  console.log(`Starting Memecoin Trader (Mode: ${isDryRun ? 'DRY RUN' : 'LIVE'})...`);
+  await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
   
   // 1. Get Wallet Info
   try {
@@ -274,11 +316,22 @@ async function main() {
       console.log(`  Liquidity: $${bestPair.liquidity.usd}`);
       console.log(`  FDV: $${bestPair.fdv}`);
       
-      tokensToBuy.push({
+      const tokenInfo: Token = {
         address: bestPair.baseToken.address,
         symbol: bestPair.baseToken.symbol,
         repo: repo.name
-      });
+      };
+
+      await telegram.sendMessage(
+        `🔍 *Opportunity Found*\n` +
+        `Repo: [${repo.name}](${repo.html_url})\n` +
+        `Token: ${tokenInfo.symbol}\n` +
+        `Liquidity: $${bestPair.liquidity.usd.toLocaleString()}\n` + 
+        `FDV: $${bestPair.fdv.toLocaleString()}\n` +
+        `Address: \`${tokenInfo.address}\``
+      );
+
+      tokensToBuy.push(tokenInfo);
     }
     
     // Rate limit: 3 requests per second max for DexScreener (approx 300ms wait)
@@ -287,6 +340,7 @@ async function main() {
 
   if (tokensToBuy.length === 0) {
     console.log('No matching tokens found.');
+    await telegram.sendMessage(`💤 No matching tokens found in this run.`);
     return;
   }
 
@@ -297,7 +351,16 @@ async function main() {
     console.log(`Buying 0.0001 ETH of ${token.symbol} (${token.repo})...`);
     
     // Attempt the swap via Vincent Wallet
-    await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
+    const result = await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
+    
+    if (result) {
+      await telegram.sendMessage(
+        `💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
+        `Token: ${token.symbol}\n` +
+        `Amount: 0.0001 ETH\n` +
+        `Status: ${isDryRun ? 'Simulated' : 'Submitted'}`
+      );
+    }
     
     // Wait to facilitate RPC/Wallet rate limits
     await new Promise(r => setTimeout(r, 2000));

@@ -52,6 +52,11 @@ class VincentWallet {
     async swap(tokenAddress, amountInEth) {
         // 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE represents native ETH
         const sellToken = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+        // Check if DRY_RUN is enabled
+        if (process.env.DRY_RUN === 'true') {
+            console.log(`[DRY RUN] Would swap ${amountInEth} ETH for ${tokenAddress}`);
+            return { status: 'simulated', txHash: '0x_simulated_hash' };
+        }
         try {
             console.log(`Attempting to swap ${amountInEth} ETH for ${tokenAddress}...`);
             const body = {
@@ -129,13 +134,44 @@ class MarketScanner {
     }
 }
 // ----------------------
+// Telegram Notifier
+// ----------------------
+class TelegramNotifier {
+    botToken;
+    chatId;
+    constructor() {
+        this.botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+        this.chatId = process.env.TELEGRAM_CHAT_ID || '';
+    }
+    async sendMessage(text) {
+        if (!this.botToken || !this.chatId) {
+            console.log('[Telegram] No credentials, skipping message:', text);
+            return;
+        }
+        try {
+            const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
+            await axios_1.default.post(url, {
+                chat_id: this.chatId,
+                text: text,
+                parse_mode: 'Markdown'
+            });
+        }
+        catch (e) {
+            console.error('[Telegram] Failed to send message:', e.message);
+        }
+    }
+}
+// ----------------------
 // Main Application Logic
 // ----------------------
 async function main() {
     const wallet = new VincentWallet();
     const githubScanner = new GitHubScanner();
     const marketScanner = new MarketScanner();
-    console.log('Starting Memecoin Trader (TypeScript Edition)...');
+    const telegram = new TelegramNotifier();
+    const isDryRun = process.env.DRY_RUN === 'true';
+    console.log(`Starting Memecoin Trader (Mode: ${isDryRun ? 'DRY RUN' : 'LIVE'})...`);
+    await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
     // 1. Get Wallet Info
     try {
         const address = await wallet.getAddress();
@@ -166,17 +202,25 @@ async function main() {
             console.log(`  Found matching token for ${repo.name}: ${bestPair.baseToken.symbol} (${bestPair.baseToken.address})`);
             console.log(`  Liquidity: $${bestPair.liquidity.usd}`);
             console.log(`  FDV: $${bestPair.fdv}`);
-            tokensToBuy.push({
+            const tokenInfo = {
                 address: bestPair.baseToken.address,
                 symbol: bestPair.baseToken.symbol,
                 repo: repo.name
-            });
+            };
+            await telegram.sendMessage(`🔍 *Opportunity Found*\n` +
+                `Repo: [${repo.name}](${repo.html_url})\n` +
+                `Token: ${tokenInfo.symbol}\n` +
+                `Liquidity: $${bestPair.liquidity.usd.toLocaleString()}\n` +
+                `FDV: $${bestPair.fdv.toLocaleString()}\n` +
+                `Address: \`${tokenInfo.address}\``);
+            tokensToBuy.push(tokenInfo);
         }
         // Rate limit: 3 requests per second max for DexScreener (approx 300ms wait)
         await new Promise(r => setTimeout(r, 300));
     }
     if (tokensToBuy.length === 0) {
         console.log('No matching tokens found.');
+        await telegram.sendMessage(`💤 No matching tokens found in this run.`);
         return;
     }
     // 3. Buy Strategy
@@ -184,7 +228,13 @@ async function main() {
     for (const token of tokensToBuy) {
         console.log(`Buying 0.0001 ETH of ${token.symbol} (${token.repo})...`);
         // Attempt the swap via Vincent Wallet
-        await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
+        const result = await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
+        if (result) {
+            await telegram.sendMessage(`💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
+                `Token: ${token.symbol}\n` +
+                `Amount: 0.0001 ETH\n` +
+                `Status: ${isDryRun ? 'Simulated' : 'Submitted'}`);
+        }
         // Wait to facilitate RPC/Wallet rate limits
         await new Promise(r => setTimeout(r, 2000));
     }
