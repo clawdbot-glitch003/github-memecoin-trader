@@ -19,11 +19,25 @@ interface TradeRecord {
   symbol: string;
   address: string;
   source: string;
-  action: 'buy';
+  action: 'buy' | 'sell_tp' | 'sell_sl';
   amount_eth: number;
+  amount_token?: number;
+  price_eth?: number;
   status: 'simulated' | 'executed' | 'failed';
   tx_hash?: string;
   repo?: string;
+  pnl_usd?: number;
+}
+
+interface PortfolioState {
+  cash_eth: number;
+  positions: {
+    [address: string]: {
+      symbol: string;
+      amount: number;
+      entry_price_eth: number;
+    }
+  };
 }
 
 interface GitHubRepo {
@@ -62,9 +76,9 @@ interface SwapExecuteRequest extends SwapPreviewRequest {}
 
 interface ClankerMarketData {
   market_cap?: number;
-  market_cap_usd?: number; // Added to support potential variations
+  market_cap_usd?: number;
   liquidity?: number;
-  liquidity_usd?: number; // Sometimes it's this too
+  liquidity_usd?: number;
   volume_h24?: number;
 }
 
@@ -99,10 +113,93 @@ class TradeLogger {
     const line = JSON.stringify(record) + '\n';
     try {
       fs.appendFileSync(this.logPath, line, 'utf8');
-      console.log(`[DB] Trade logged: ${record.symbol} (${record.status})`);
+      console.log(`[DB] Trade logged: ${record.symbol} (${record.action})`);
     } catch (e: any) {
       console.error('[DB] Failed to log trade:', e.message);
     }
+  }
+}
+
+// ----------------------
+// Portfolio Manager (Paper Trading)
+// ----------------------
+
+class PortfolioManager {
+  private readonly dbPath: string;
+  private state: PortfolioState;
+
+  constructor() {
+    this.dbPath = path.join(process.cwd(), 'portfolio.json');
+    this.state = this.load();
+  }
+
+  private load(): PortfolioState {
+    if (fs.existsSync(this.dbPath)) {
+      try {
+        return JSON.parse(fs.readFileSync(this.dbPath, 'utf8'));
+      } catch (e) {
+        console.error('Failed to load portfolio, starting fresh.');
+      }
+    }
+    // Default starting state: 1 ETH, no positions
+    return { cash_eth: 1.0, positions: {} };
+  }
+
+  public save(): void {
+    fs.writeFileSync(this.dbPath, JSON.stringify(this.state, null, 2));
+  }
+
+  public getBalance(): number {
+    return this.state.cash_eth;
+  }
+
+  public canAfford(amountEth: number): boolean {
+    return this.state.cash_eth >= amountEth;
+  }
+
+  public recordBuy(symbol: string, address: string, amountEth: number, amountToken: number, priceEth: number): void {
+    this.state.cash_eth -= amountEth;
+    
+    // Track position by address (unique key)
+    if (!this.state.positions[address]) {
+      this.state.positions[address] = { symbol, amount: 0, entry_price_eth: 0 };
+    }
+    
+    const pos = this.state.positions[address];
+    
+    // Update weighted average entry price
+    const totalValue = (pos.amount * pos.entry_price_eth) + (amountToken * priceEth);
+    const totalAmount = pos.amount + amountToken;
+    
+    if (totalAmount > 0) {
+      pos.entry_price_eth = totalValue / totalAmount;
+      pos.amount = totalAmount;
+    }
+
+    this.save();
+    console.log(`[Portfolio] Bought ${amountToken.toFixed(2)} ${symbol} @ ${priceEth.toFixed(9)} ETH. Cash left: ${this.state.cash_eth.toFixed(4)} ETH`);
+  }
+
+  public recordSell(address: string, amountToken: number, executionPriceEth: number): void {
+    const pos = this.state.positions[address];
+    if (!pos) return;
+
+    // Calculate proceeds
+    const proceeds = amountToken * executionPriceEth;
+    this.state.cash_eth += proceeds;
+    
+    // Reduce position
+    pos.amount -= amountToken;
+    if (pos.amount <= 1e-9) { // dust threshold
+      delete this.state.positions[address];
+    }
+
+    this.save();
+    console.log(`[Portfolio] Sold ${amountToken.toFixed(2)} ${pos.symbol} @ ${executionPriceEth.toFixed(9)} ETH. Cash increased to: ${this.state.cash_eth.toFixed(4)} ETH`);
+  }
+  
+  public getPositions(): { address: string, symbol: string, amount: number, entry_price_eth: number }[] {
+    return Object.entries(this.state.positions).map(([k, v]) => ({ address: k, ...v }));
   }
 }
 
@@ -141,8 +238,6 @@ class VincentWallet {
       return resp.data.address;
     } catch (e: any) {
       console.error('Error getting address:', e.message);
-      // Return empty or throw based on preference. 
-      // Returning empty string to allow dry-run to proceed if API key is partial?
       return '';
     }
   }
@@ -163,14 +258,80 @@ class VincentWallet {
     }
   }
 
+  async getQuote(tokenAddress: string, amountInEth: number): Promise<{ buyAmount: number, price: number } | null> {
+    try {
+      const sellToken = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+      const body: SwapPreviewRequest = {
+        sellToken,
+        buyToken: tokenAddress,
+        sellAmount: BigInt(Math.floor(amountInEth * 1e18)).toString(),
+        chainId: this.chainId,
+        slippageBps: 100 // 1%
+      };
+
+      const resp = await axios.post<{ buyAmount: string }>(
+        `${this.baseUrl}/api/skills/evm-wallet/swap/preview`,
+        body,
+        { headers: this.getHeaders() }
+      );
+
+      const amountOut = parseFloat(resp.data.buyAmount) / 1e18;
+      const price = amountInEth / amountOut; // Price in ETH per Token
+
+      return { buyAmount: amountOut, price };
+    } catch (e: any) {
+      // console.error(`[Wallet] Quote failed for ${tokenAddress}:`, e.message);
+      return null;
+    }
+  }
+
+  async getSellQuote(tokenAddress: string, tokenAmount: string): Promise<{ ethAmount: number, price: number } | null> {
+    try {
+      const sellToken = tokenAddress;
+      const buyToken = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"; // ETH
+      
+      const body: SwapPreviewRequest = {
+        sellToken,
+        buyToken,
+        sellAmount: tokenAmount, // exact token amount in WEI string
+        chainId: this.chainId,
+        slippageBps: 200 // 2% 
+      };
+
+      const resp = await axios.post<{ buyAmount: string }>(
+        `${this.baseUrl}/api/skills/evm-wallet/swap/preview`,
+        body,
+        { headers: this.getHeaders() }
+      );
+
+      // Output is ETH (18 decimals)
+      const ethAmount = parseFloat(resp.data.buyAmount) / 1e18;
+      const amountIn = parseFloat(tokenAmount) / 1e18;
+      const price = ethAmount / amountIn; // Price of 1 Token in ETH
+
+      return { ethAmount, price };
+    } catch (e: any) {
+      return null;
+    }
+  }
+
   public async swap(tokenAddress: string, amountInEth: number): Promise<any> {
-    // 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE represents native ETH
     const sellToken = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
     
     // Check if DRY_RUN is enabled
     if (process.env.DRY_RUN === 'true') {
-      console.log(`[DRY RUN] Would swap ${amountInEth} ETH for ${tokenAddress}`);
-      return { status: 'simulated', txHash: '0x_simulated_hash' };
+      try {
+        console.log(`[DRY RUN] Getting quote for ${amountInEth} ETH -> ${tokenAddress}...`);
+        
+        const quote = await this.getQuote(tokenAddress, amountInEth);
+        if (!quote) throw new Error('Failed to get quote');
+        
+        console.log(`[DRY RUN] Quote: ${quote.buyAmount.toFixed(2)} tokens @ ${quote.price.toFixed(9)} ETH`);
+        return { status: 'simulated', txHash: '0x_simulated_hash', buyAmount: quote.buyAmount, price: quote.price };
+      } catch (e: any) {
+        console.error(`[DRY RUN] Quote failed:`, e.message);
+        return { status: 'simulated', txHash: '0x_simulated_hash', buyAmount: 0, price: 0 };
+      }
     }
 
     try {
@@ -179,9 +340,9 @@ class VincentWallet {
       const body: SwapExecuteRequest = {
         sellToken,
         buyToken: tokenAddress,
-        sellAmount: amountInEth.toString(),
+        sellAmount: BigInt(Math.floor(amountInEth * 1e18)).toString(),
         chainId: this.chainId,
-        slippageBps: 200 // 2% slippage for volatility
+        slippageBps: 200 // 2% slippage
       };
 
       const resp = await axios.post(
@@ -193,7 +354,6 @@ class VincentWallet {
       console.log('Swap executed!', resp.data);
       return resp.data;
     } catch (e: any) {
-      // Log basic error info but don't crash
       console.error('Swap failed:', e.response?.data || e.message);
       return null;
     }
@@ -212,7 +372,6 @@ class GitHubScanner {
   }
 
   public async getTrendingRepos(): Promise<GitHubRepo[]> {
-    // Search for repos created in the last 7 days, sorted by stars
     const date = new Date();
     date.setDate(date.getDate() - 7);
     const dateStr = date.toISOString().split('T')[0];
@@ -246,15 +405,14 @@ class GitHubScanner {
 class ClankerScanner {
   private readonly baseUrl = 'https://www.clanker.world/api/tokens';
 
-  // Search specifically for a token by name/symbol using Clanker API
   public async searchToken(query: string): Promise<ClankerToken[]> {
     try {
       const resp = await axios.get<ClankerResponse>(this.baseUrl, {
         params: {
           search: query, 
-          q: query, // Fallback common param
+          q: query,
           chainId: 8453,
-          sort: 'desc', // Newest first
+          sort: 'desc',
           limit: 5
         },
         headers: {
@@ -268,9 +426,7 @@ class ClankerScanner {
       } else if (resp.data && Array.isArray((resp.data as any).data)) {
         tokenList = (resp.data as any).data;
       }
-      
       return tokenList;
-
     } catch (e: any) {
       return [];
     }
@@ -321,140 +477,160 @@ async function main() {
   const clankerScanner = new ClankerScanner();
   const telegram = new TelegramNotifier();
   const logger = new TradeLogger();
-
+  const portfolio = new PortfolioManager();
+  
   const isDryRun = process.env.DRY_RUN === 'true';
 
   console.log(`Starting Memecoin Trader (Mode: ${isDryRun ? 'DRY RUN' : 'LIVE'})...`);
   if (process.env.ENABLE_TELEGRAM === 'true') {
     await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
   }
-  
-  // 1. Get Wallet Info
-  try {
-    const address = await wallet.getAddress();
-    console.log(`Wallet Address: ${address || 'Unknown'}`);
-  } catch (error) {
-    console.error('Failed to initialize wallet. Check your API key.');
-    process.exit(1);
-  }
 
-  // 2. Scan GitHub for Trending Repos
-  console.log('Scanning trending GitHub repos...');
-  const repos = await githubScanner.getTrendingRepos();
-  console.log(`Found ${repos.length} potential GitHub repos.`);
+  // Infinite loop for "every 10 minutes"
+  while (true) {
+    console.log(`\n--- Cycle Start (${new Date().toISOString()}) ---`);
+    console.log(`[Portfolio] Cash: ${portfolio.getBalance().toFixed(4)} ETH. Positions: ${portfolio.getPositions().length}`);
 
-  const tokensToBuy: Token[] = [];
-
-  for (const repo of repos) {
-    // Clean repo name: "Code-Pilot" -> "Code Pilot", "React2Shell" -> "React2Shell"
-    // Also split camelCase: "codePilot" -> "code Pilot"
-    const cleanName = repo.name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_.]/g, ' ').toLowerCase();
-    
-    console.log(`Checking Clanker for repo: ${repo.name} (query: "${cleanName}")...`);
-    
-    // Search Clanker for tokens matching the cleaned repo name
-    const matchingTokens = await clankerScanner.searchToken(cleanName);
-    
-    if (matchingTokens.length > 0) {
-      // Pick the best match (first one, assuming sort=desc gives newest/best match)
-      const bestMatch = matchingTokens[0];
-      
-      // Calculate Age
-      const createdAt = new Date(bestMatch.created_at).getTime();
-      const ageHours = (Date.now() - createdAt) / (1000 * 60 * 60);
-
-      // Filter: Freshness (< 7 days)
-      if (ageHours > 7 * 24) {
-        console.log(`  Skipping ${bestMatch.symbol}: Too old (${(ageHours/24).toFixed(1)} days)`);
-        continue;
+    // 0. Update Prices & Check Stops (TP/SL)
+    try {
+      const portfolioPositions = portfolio.getPositions();
+      if (portfolioPositions.length > 0) {
+        console.log(`Checking ${portfolioPositions.length} positions for TP/SL...`);
+        for (const pos of portfolioPositions) {
+          const tokenAmountWei = BigInt(Math.floor(pos.amount * 1e18)).toString();
+          
+          // Get SELL quote (Token -> ETH)
+          const quote = await wallet.getSellQuote(pos.address, tokenAmountWei);
+          
+          if (quote) {
+             const currentPrice = quote.price; // ETH per Token
+             const entryPrice = pos.entry_price_eth; // ETH per Token
+             const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+             
+             console.log(`  [Pos] ${pos.symbol}: Entry ${entryPrice.toFixed(9)} -> Current ${currentPrice.toFixed(9)} ETH (${pnlPercent.toFixed(2)}%)`);
+             
+             // TP: +50%, SL: -20%
+             let action: 'sell_tp' | 'sell_sl' | null = null;
+             if (pnlPercent >= 50) action = 'sell_tp';
+             if (pnlPercent <= -20) action = 'sell_sl';
+             
+             if (action) {
+               console.log(`  🚨 Triggering ${action === 'sell_tp' ? 'TAKE PROFIT' : 'STOP LOSS'} for ${pos.symbol}...`);
+               
+               // Simulating Sell for Portfolio
+               portfolio.recordSell(pos.address, pos.amount, currentPrice);
+               
+               // Log Trade
+               logger.log({
+                  timestamp: new Date().toISOString(),
+                  symbol: pos.symbol,
+                  address: pos.address,
+                  source: 'portfolio',
+                  action: action,
+                  amount_token: pos.amount,
+                  amount_eth: quote.ethAmount,
+                  price_eth: currentPrice,
+                  status: isDryRun ? 'simulated' : 'executed',
+                  repo: 'portfolio_manager', // Automated action
+                  pnl_usd: 0 
+               });
+               
+               await telegram.sendMessage(
+                  `📉 *${action === 'sell_tp' ? 'Take Profit' : 'Stop Loss'} Executed*\n` +
+                  `Token: ${pos.symbol}\n` +
+                  `PnL: ${pnlPercent.toFixed(2)}%\n` +
+                  `Price: ${currentPrice.toFixed(9)} ETH\n` +
+                  `Proceeds: ${quote.ethAmount.toFixed(4)} ETH`
+               );
+             }
+          }
+          // Rate limit check
+          await new Promise(r => setTimeout(r, 1000));
+        }
       }
-      
-      // Deduplication check: Don't buy same token twice in one run
-      if (tokensToBuy.some(t => t.address === bestMatch.contract_address)) {
-        continue;
-      }
-
-      console.log(`  Found matching Clanker token for ${repo.name}: ${bestMatch.symbol} (${bestMatch.contract_address})`);
-      console.log(`  Age: ${(ageHours/24).toFixed(1)} days`);
-
-      const tokenInfo: Token = {
-        address: bestMatch.contract_address,
-        symbol: bestMatch.symbol,
-        repo: repo.name,
-        source: 'clanker'
-      };
-
-      await telegram.sendMessage(
-        `🔍 *GitHub x Clanker Opportunity*\n` +
-        `Repo: [${repo.name}](${repo.html_url})\n` +
-        `Token: ${tokenInfo.symbol}\n` +
-        `Age: ${(ageHours/24).toFixed(1)} days\n` +
-        `Address: \`${tokenInfo.address}\``
-      );
-
-      tokensToBuy.push(tokenInfo);
+    } catch (e) {
+      console.error('Portfolio update failed:', e);
     }
-    
-    // Rate limit: 1000ms to be kind to Clanker API during search
-    await new Promise(r => setTimeout(r, 1000));
-  }
 
-  if (tokensToBuy.length === 0) {
-    console.log('No matching tokens found.');
-    return;
-  }
-
-  // 3. Buy Strategy
-  console.log(`\nAttempting to buy ${tokensToBuy.length} tokens...`);
-  
-  for (const token of tokensToBuy) {
-    console.log(`Buying 0.0001 ETH of ${token.symbol} (${token.source})...`);
-    
-    // Attempt the swap via Vincent Wallet
-    const result = await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
-    
-    if (result) {
-      const status = isDryRun ? 'simulated' : 'executed';
-      
-      // Log to DB
-      logger.log({
-        timestamp: new Date().toISOString(),
-        symbol: token.symbol,
-        address: token.address,
-        source: token.source,
-        action: 'buy',
-        amount_eth: 0.0001,
-        status: status,
-        tx_hash: result.txHash,
-        repo: token.repo
-      });
-
-      await telegram.sendMessage(
-        `💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
-        `Token: ${token.symbol}\n` +
-        `Source: ${token.source}\n` +
-        `Amount: 0.0001 ETH\n` +
-        `Status: ${isDryRun ? 'Simulated' : 'Submitted'}`
-      );
+    // 1. Scan GitHub for NEW Opportunities
+    if (!portfolio.canAfford(0.0001)) {
+       console.log('Skipping GitHub scan: Not enough ETH for new buys (min 0.0001).');
     } else {
-      // Log failure
-      logger.log({
-        timestamp: new Date().toISOString(),
-        symbol: token.symbol,
-        address: token.address,
-        source: token.source,
-        action: 'buy',
-        amount_eth: 0.0001,
-        status: 'failed',
-        repo: token.repo
-      });
-    }
-    
-    // Wait to facilitate RPC/Wallet rate limits
-    await new Promise(r => setTimeout(r, 2000));
-  }
+      console.log('Scanning trending GitHub repos...');
+      const repos = await githubScanner.getTrendingRepos();
+      
+      for (const repo of repos) {
+        // Clean repo name
+        const cleanName = repo.name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_.]/g, ' ').toLowerCase();
+        
+        console.log(`Checking Clanker for repo: ${repo.name} (query: "${cleanName}")...`);
+        const matchingTokens = await clankerScanner.searchToken(cleanName);
+        
+        if (matchingTokens.length > 0) {
+          const bestMatch = matchingTokens[0];
+          const createdAt = new Date(bestMatch.created_at).getTime();
+          const ageHours = (Date.now() - createdAt) / (1000 * 60 * 60);
 
-  console.log('Run complete.');
+          // Filter: Freshness (< 7 days)
+          if (ageHours > 7 * 24) {
+            console.log(`  Skipping ${bestMatch.symbol}: Too old (${(ageHours/24).toFixed(1)} days)`);
+            continue;
+          }
+          
+          // Deduplication check (Portfolio)
+          const existingPos = portfolio.getPositions().find(p => p.address === bestMatch.contract_address);
+          if (existingPos) {
+             console.log(`  Skipping ${bestMatch.symbol}: Already holding position.`);
+             continue;
+          }
+
+          console.log(`  Found Opportunity: ${bestMatch.symbol} (${bestMatch.contract_address}). Age: ${(ageHours/24).toFixed(1)} days.`);
+
+          // Buy
+          const buyAmt = 0.0001; 
+          console.log(`Buying ${buyAmt} ETH of ${bestMatch.symbol}...`);
+          
+          const result = await wallet.swap(bestMatch.contract_address, buyAmt);
+          
+          if (result) {
+            const status = isDryRun ? 'simulated' : 'executed';
+            const buyAmount = (result as any).buyAmount || 0;
+            const priceEth = (result as any).price || 0;
+
+            if (buyAmount > 0) {
+              portfolio.recordBuy(bestMatch.symbol, bestMatch.contract_address, buyAmt, buyAmount, priceEth);
+            }
+
+            logger.log({
+              timestamp: new Date().toISOString(),
+              symbol: bestMatch.symbol,
+              address: bestMatch.contract_address,
+              source: 'clanker',
+              action: 'buy',
+              amount_eth: buyAmt,
+              amount_token: buyAmount,
+              price_eth: priceEth,
+              status: status,
+              tx_hash: result.txHash,
+              repo: repo.name
+            });
+
+            await telegram.sendMessage(
+              `💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
+              `Token: ${bestMatch.symbol}\n` +
+              `Repo: ${repo.name}\n` + 
+              `Entry: ${priceEth.toFixed(9)} ETH`
+            );
+          }
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    // Wait 10 minutes for next cycle
+    console.log('[Cycle End] Waiting 10 minutes...');
+    await new Promise(r => setTimeout(r, 10 * 60 * 1000));
+  }
 }
 
 // Execute
