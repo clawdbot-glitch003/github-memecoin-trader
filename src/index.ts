@@ -11,7 +11,7 @@ interface Token {
   address: string;
   symbol: string;
   repo?: string;
-  source: 'github' | 'clanker';
+  source: 'clanker';
 }
 
 interface TradeRecord {
@@ -40,34 +40,6 @@ interface GitHubSearchResponse {
   items: GitHubRepo[];
 }
 
-interface DexScreenerToken {
-  address: string;
-  name: string;
-  symbol: string;
-}
-
-interface DexScreenerPair {
-  chainId: string;
-  dexId: string;
-  url: string;
-  baseToken: DexScreenerToken;
-  quoteToken: DexScreenerToken;
-  priceNative: string;
-  priceUsd: string;
-  liquidity?: { // Optional just in case
-    usd: number;
-    base: number;
-    quote: number;
-  };
-  fdv: number;
-  pairCreatedAt?: number; // Added for age check
-}
-
-interface DexScreenerResponse {
-  schemaVersion: string;
-  pairs: DexScreenerPair[];
-}
-
 interface WalletAddressResponse {
   address: string;
 }
@@ -89,8 +61,10 @@ interface SwapPreviewRequest {
 interface SwapExecuteRequest extends SwapPreviewRequest {}
 
 interface ClankerMarketData {
-  market_cap?: number; // API field is often 'market_cap' or 'market_cap_usd', docs say 'market data'. let's map loosely
+  market_cap?: number;
+  market_cap_usd?: number; // Added to support potential variations
   liquidity?: number;
+  liquidity_usd?: number; // Sometimes it's this too
   volume_h24?: number;
 }
 
@@ -167,7 +141,9 @@ class VincentWallet {
       return resp.data.address;
     } catch (e: any) {
       console.error('Error getting address:', e.message);
-      throw e;
+      // Return empty or throw based on preference. 
+      // Returning empty string to allow dry-run to proceed if API key is partial?
+      return '';
     }
   }
 
@@ -264,88 +240,38 @@ class GitHubScanner {
 }
 
 // ----------------------
-// Market Scanner (DexScreener)
-// ----------------------
-
-class MarketScanner {
-  private readonly baseUrl: string;
-
-  constructor() {
-    this.baseUrl = 'https://api.dexscreener.com/latest/dex';
-  }
-
-  public async searchToken(query: string): Promise<DexScreenerPair[]> {
-    try {
-      // DexScreener search endpoint
-      const url = `${this.baseUrl}/search?q=${encodeURIComponent(query)}`;
-      const resp = await axios.get<DexScreenerResponse>(url);
-      
-      if (!resp.data || !resp.data.pairs) return [];
-      
-      // Filter strictly for Base chain
-      return resp.data.pairs.filter(p => p.chainId === 'base');
-    } catch (e: any) {
-      console.error(`DexScreener API error for query "${query}":`, e.message);
-      return [];
-    }
-  }
-}
-
-// ----------------------
 // Clanker Scanner
 // ----------------------
 
 class ClankerScanner {
   private readonly baseUrl = 'https://www.clanker.world/api/tokens';
-  private readonly seenTokens = new Set<string>();
 
-  public async getNewTokens(): Promise<Token[]> {
+  // Search specifically for a token by name/symbol using Clanker API
+  public async searchToken(query: string): Promise<ClankerToken[]> {
     try {
-      // Fetch newest tokens
       const resp = await axios.get<ClankerResponse>(this.baseUrl, {
         params: {
-          sort: 'desc',
-          limit: 10,
-          includeMarket: true,
-          chainId: 8453 // Base
+          search: query, 
+          q: query, // Fallback common param
+          chainId: 8453,
+          sort: 'desc', // Newest first
+          limit: 5
         },
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
       });
 
-      const newTokens: Token[] = [];
-      
       let tokenList: ClankerToken[] = [];
       if (Array.isArray(resp.data)) {
         tokenList = resp.data;
       } else if (resp.data && Array.isArray((resp.data as any).data)) {
         tokenList = (resp.data as any).data;
       }
-
-      for (const t of tokenList) {
-        // Deduplicate
-        if (this.seenTokens.has(t.contract_address)) continue;
-        this.seenTokens.add(t.contract_address);
-
-        // Filter: Created very recently? (e.g. last 24 hours)
-        const createdAt = new Date(t.created_at).getTime();
-        const ageHours = (Date.now() - createdAt) / (1000 * 60 * 60);
-
-        // Only look at stuff from last 24h
-        if (ageHours > 24) continue;
-
-        newTokens.push({
-          address: t.contract_address,
-          symbol: t.symbol,
-          source: 'clanker'
-        });
-      }
-
-      return newTokens;
+      
+      return tokenList;
 
     } catch (e: any) {
-      console.error('[Clanker] API Error:', e.message);
       return [];
     }
   }
@@ -393,7 +319,6 @@ async function main() {
   const wallet = new VincentWallet();
   const githubScanner = new GitHubScanner();
   const clankerScanner = new ClankerScanner();
-  const marketScanner = new MarketScanner();
   const telegram = new TelegramNotifier();
   const logger = new TradeLogger();
 
@@ -407,25 +332,10 @@ async function main() {
   // 1. Get Wallet Info
   try {
     const address = await wallet.getAddress();
-    console.log(`Wallet Address: ${address}`);
+    console.log(`Wallet Address: ${address || 'Unknown'}`);
   } catch (error) {
     console.error('Failed to initialize wallet. Check your API key.');
     process.exit(1);
-  }
-
-  // 1a. Scan Clanker (Newest Tokens)
-  console.log('Scanning Clanker for new launches...');
-  const clankerTokens = await clankerScanner.getNewTokens();
-  console.log(`Found ${clankerTokens.length} fresh Clanker tokens.`);
-  
-  // Alert for Clanker Tokens
-  for (const t of clankerTokens) {
-    await telegram.sendMessage(
-      `🆕 *Clanker Launch*\n` +
-      `Token: ${t.symbol}\n` +
-      `Source: Clanker API\n` + 
-      `Address: \`${t.address}\``
-    );
   }
 
   // 2. Scan GitHub for Trending Repos
@@ -433,75 +343,64 @@ async function main() {
   const repos = await githubScanner.getTrendingRepos();
   console.log(`Found ${repos.length} potential GitHub repos.`);
 
-  const tokensToBuy: Token[] = [...clankerTokens]; // Start with Clanker picks
+  const tokensToBuy: Token[] = [];
 
   for (const repo of repos) {
-    console.log(`Checking market for repo: ${repo.name}...`);
+    // Clean repo name: "Code-Pilot" -> "Code Pilot", "React2Shell" -> "React2Shell"
+    // Also split camelCase: "codePilot" -> "code Pilot"
+    const cleanName = repo.name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_.]/g, ' ').toLowerCase();
     
-    // Search DexScreener for tokens matching the repo name
-    const pairs = await marketScanner.searchToken(repo.name);
+    console.log(`Checking Clanker for repo: ${repo.name} (query: "${cleanName}")...`);
     
-    if (pairs.length > 0) {
-      // Filter out pairs with missing liquidity
-      const validPairs = pairs.filter(p => p.liquidity && p.liquidity.usd > 0);
+    // Search Clanker for tokens matching the cleaned repo name
+    const matchingTokens = await clankerScanner.searchToken(cleanName);
+    
+    if (matchingTokens.length > 0) {
+      // Pick the best match (first one, assuming sort=desc gives newest/best match)
+      const bestMatch = matchingTokens[0];
       
-      // Sort by liquidity (highest first)
-      validPairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)); // Use optional chaining
+      // Calculate Age
+      const createdAt = new Date(bestMatch.created_at).getTime();
+      const ageHours = (Date.now() - createdAt) / (1000 * 60 * 60);
+
+      // Filter: Freshness (< 7 days)
+      if (ageHours > 7 * 24) {
+        console.log(`  Skipping ${bestMatch.symbol}: Too old (${(ageHours/24).toFixed(1)} days)`);
+        continue;
+      }
       
-      if (validPairs.length === 0) continue;
-      
-      const bestPair = validPairs[0];
-      
-      // Safety Checks
-      // 1. Minimum Liquidity $5k
-      if ((bestPair.liquidity?.usd || 0) < 5000) {
-        console.log(`  Skipping ${bestPair.baseToken.symbol}: Low liquidity ($${bestPair.liquidity?.usd})`);
+      // Deduplication check: Don't buy same token twice in one run
+      if (tokensToBuy.some(t => t.address === bestMatch.contract_address)) {
         continue;
       }
 
-      // 2. Token Age Check (e.g., must be younger than 7 days to be "fresh")
-      // DexScreener might return pairCreatedAt in ms
-      const createdAt = bestPair.pairCreatedAt || Date.now();
-      const pairAgeMs = Date.now() - createdAt;
-      const pairAgeDays = pairAgeMs / (1000 * 60 * 60 * 24);
-      
-      if (pairAgeDays > 7) {
-        console.log(`  Skipping ${bestPair.baseToken.symbol}: Too old (${pairAgeDays.toFixed(1)} days)`);
-        continue;
-      }
+      console.log(`  Found matching Clanker token for ${repo.name}: ${bestMatch.symbol} (${bestMatch.contract_address})`);
+      console.log(`  Age: ${(ageHours/24).toFixed(1)} days`);
 
-      console.log(`  Found matching token for ${repo.name}: ${bestPair.baseToken.symbol} (${bestPair.baseToken.address})`);
-      console.log(`  Liquidity: $${bestPair.liquidity?.usd}`);
-      console.log(`  FDV: $${bestPair.fdv}`);
-      console.log(`  Age: ${pairAgeDays.toFixed(1)} days`);
-      
       const tokenInfo: Token = {
-        address: bestPair.baseToken.address,
-        symbol: bestPair.baseToken.symbol,
+        address: bestMatch.contract_address,
+        symbol: bestMatch.symbol,
         repo: repo.name,
-        source: 'github'
+        source: 'clanker'
       };
 
       await telegram.sendMessage(
-        `🔍 *GitHub Opportunity*\n` +
+        `🔍 *GitHub x Clanker Opportunity*\n` +
         `Repo: [${repo.name}](${repo.html_url})\n` +
         `Token: ${tokenInfo.symbol}\n` +
-        `Liquidity: $${bestPair.liquidity?.usd?.toLocaleString() || 'Unknown'}\n` + 
-        `FDV: $${bestPair.fdv?.toLocaleString() || 'Unknown'}\n` +
-        `Age: ${pairAgeDays.toFixed(1)} days\n` +
+        `Age: ${(ageHours/24).toFixed(1)} days\n` +
         `Address: \`${tokenInfo.address}\``
       );
 
       tokensToBuy.push(tokenInfo);
     }
     
-    // Rate limit: 3 requests per second max for DexScreener (approx 300ms wait)
-    await new Promise(r => setTimeout(r, 300));
+    // Rate limit: 1000ms to be kind to Clanker API during search
+    await new Promise(r => setTimeout(r, 1000));
   }
 
   if (tokensToBuy.length === 0) {
     console.log('No matching tokens found.');
-    await telegram.sendMessage(`💤 No matching tokens found in this run.`);
     return;
   }
 
@@ -537,6 +436,18 @@ async function main() {
         `Amount: 0.0001 ETH\n` +
         `Status: ${isDryRun ? 'Simulated' : 'Submitted'}`
       );
+    } else {
+      // Log failure
+      logger.log({
+        timestamp: new Date().toISOString(),
+        symbol: token.symbol,
+        address: token.address,
+        source: token.source,
+        action: 'buy',
+        amount_eth: 0.0001,
+        status: 'failed',
+        repo: token.repo
+      });
     }
     
     // Wait to facilitate RPC/Wallet rate limits
