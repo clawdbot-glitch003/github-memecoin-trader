@@ -1,10 +1,64 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const axios_1 = __importDefault(require("axios"));
 require("dotenv/config");
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+// ----------------------
+// Trade Logger (Local DB)
+// ----------------------
+class TradeLogger {
+    logPath;
+    constructor() {
+        this.logPath = path.join(process.cwd(), 'trades.jsonl');
+    }
+    log(record) {
+        const line = JSON.stringify(record) + '\n';
+        try {
+            fs.appendFileSync(this.logPath, line, 'utf8');
+            console.log(`[DB] Trade logged: ${record.symbol} (${record.status})`);
+        }
+        catch (e) {
+            console.error('[DB] Failed to log trade:', e.message);
+        }
+    }
+}
 // ----------------------
 // Vincent Wallet Client
 // ----------------------
@@ -197,6 +251,8 @@ class TelegramNotifier {
         this.chatId = process.env.TELEGRAM_CHAT_ID || '';
     }
     async sendMessage(text) {
+        if (process.env.ENABLE_TELEGRAM !== 'true')
+            return;
         if (!this.botToken || !this.chatId) {
             console.log('[Telegram] No credentials, skipping message:', text);
             return;
@@ -223,9 +279,12 @@ async function main() {
     const clankerScanner = new ClankerScanner();
     const marketScanner = new MarketScanner();
     const telegram = new TelegramNotifier();
+    const logger = new TradeLogger();
     const isDryRun = process.env.DRY_RUN === 'true';
     console.log(`Starting Memecoin Trader (Mode: ${isDryRun ? 'DRY RUN' : 'LIVE'})...`);
-    await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
+    if (process.env.ENABLE_TELEGRAM === 'true') {
+        await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
+    }
     // 1. Get Wallet Info
     try {
         const address = await wallet.getAddress();
@@ -312,6 +371,19 @@ async function main() {
         // Attempt the swap via Vincent Wallet
         const result = await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
         if (result) {
+            const status = isDryRun ? 'simulated' : 'executed';
+            // Log to DB
+            logger.log({
+                timestamp: new Date().toISOString(),
+                symbol: token.symbol,
+                address: token.address,
+                source: token.source,
+                action: 'buy',
+                amount_eth: 0.0001,
+                status: status,
+                tx_hash: result.txHash,
+                repo: token.repo
+            });
             await telegram.sendMessage(`💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
                 `Token: ${token.symbol}\n` +
                 `Source: ${token.source}\n` +

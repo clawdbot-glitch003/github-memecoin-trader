@@ -1,5 +1,7 @@
 import axios, { type AxiosRequestConfig } from 'axios';
 import 'dotenv/config';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // ----------------------
 // Interfaces
@@ -10,6 +12,18 @@ interface Token {
   symbol: string;
   repo?: string;
   source: 'github' | 'clanker';
+}
+
+interface TradeRecord {
+  timestamp: string;
+  symbol: string;
+  address: string;
+  source: string;
+  action: 'buy';
+  amount_eth: number;
+  status: 'simulated' | 'executed' | 'failed';
+  tx_hash?: string;
+  repo?: string;
 }
 
 interface GitHubRepo {
@@ -94,6 +108,28 @@ interface ClankerToken { // Clanker API structure
 interface ClankerResponse {
   data: ClankerToken[];
   pagination: any;
+}
+
+// ----------------------
+// Trade Logger (Local DB)
+// ----------------------
+
+class TradeLogger {
+  private readonly logPath: string;
+
+  constructor() {
+    this.logPath = path.join(process.cwd(), 'trades.jsonl');
+  }
+
+  public log(record: TradeRecord): void {
+    const line = JSON.stringify(record) + '\n';
+    try {
+      fs.appendFileSync(this.logPath, line, 'utf8');
+      console.log(`[DB] Trade logged: ${record.symbol} (${record.status})`);
+    } catch (e: any) {
+      console.error('[DB] Failed to log trade:', e.message);
+    }
+  }
 }
 
 // ----------------------
@@ -329,6 +365,8 @@ class TelegramNotifier {
   }
 
   public async sendMessage(text: string): Promise<void> {
+    if (process.env.ENABLE_TELEGRAM !== 'true') return;
+
     if (!this.botToken || !this.chatId) {
       console.log('[Telegram] No credentials, skipping message:', text);
       return;
@@ -357,11 +395,14 @@ async function main() {
   const clankerScanner = new ClankerScanner();
   const marketScanner = new MarketScanner();
   const telegram = new TelegramNotifier();
+  const logger = new TradeLogger();
 
   const isDryRun = process.env.DRY_RUN === 'true';
 
   console.log(`Starting Memecoin Trader (Mode: ${isDryRun ? 'DRY RUN' : 'LIVE'})...`);
-  await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
+  if (process.env.ENABLE_TELEGRAM === 'true') {
+    await telegram.sendMessage(`🚀 *Memecoin Trader Started*\nMode: ${isDryRun ? 'DRY RUN' : 'LIVE'}`);
+  }
   
   // 1. Get Wallet Info
   try {
@@ -474,6 +515,21 @@ async function main() {
     const result = await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
     
     if (result) {
+      const status = isDryRun ? 'simulated' : 'executed';
+      
+      // Log to DB
+      logger.log({
+        timestamp: new Date().toISOString(),
+        symbol: token.symbol,
+        address: token.address,
+        source: token.source,
+        action: 'buy',
+        amount_eth: 0.0001,
+        status: status,
+        tx_hash: result.txHash,
+        repo: token.repo
+      });
+
       await telegram.sendMessage(
         `💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
         `Token: ${token.symbol}\n` +
