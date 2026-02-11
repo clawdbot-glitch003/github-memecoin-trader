@@ -74,15 +74,21 @@ interface SwapPreviewRequest {
 
 interface SwapExecuteRequest extends SwapPreviewRequest {}
 
+interface ClankerMarketData {
+  market_cap?: number; // API field is often 'market_cap' or 'market_cap_usd', docs say 'market data'. let's map loosely
+  liquidity?: number;
+  volume_h24?: number;
+}
+
 interface ClankerToken { // Clanker API structure
   name: string;
   symbol: string;
   contract_address: string;
   created_at: string;
   tx_hash: string;
-  market_cap_usd?: number;
-  liquidity_usd?: number;
-  volume_h24?: number;
+  related?: {
+    market?: ClankerMarketData;
+  };
 }
 
 interface ClankerResponse {
