@@ -8,7 +8,8 @@ import 'dotenv/config';
 interface Token {
   address: string;
   symbol: string;
-  repo: string;
+  repo?: string;
+  source: 'github' | 'clanker';
 }
 
 interface GitHubRepo {
@@ -72,6 +73,22 @@ interface SwapPreviewRequest {
 }
 
 interface SwapExecuteRequest extends SwapPreviewRequest {}
+
+interface ClankerToken { // Clanker API structure
+  name: string;
+  symbol: string;
+  contract_address: string;
+  created_at: string;
+  tx_hash: string;
+  market_cap_usd?: number;
+  liquidity_usd?: number;
+  volume_h24?: number;
+}
+
+interface ClankerResponse {
+  data: ClankerToken[];
+  pagination: any;
+}
 
 // ----------------------
 // Vincent Wallet Client
@@ -233,6 +250,66 @@ class MarketScanner {
 }
 
 // ----------------------
+// Clanker Scanner
+// ----------------------
+
+class ClankerScanner {
+  private readonly baseUrl = 'https://www.clanker.world/api/tokens';
+  private readonly seenTokens = new Set<string>();
+
+  public async getNewTokens(): Promise<Token[]> {
+    try {
+      // Fetch newest tokens
+      const resp = await axios.get<ClankerResponse>(this.baseUrl, {
+        params: {
+          sort: 'desc',
+          limit: 10,
+          includeMarket: true,
+          chainId: 8453 // Base
+        },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      });
+
+      const newTokens: Token[] = [];
+      
+      let tokenList: ClankerToken[] = [];
+      if (Array.isArray(resp.data)) {
+        tokenList = resp.data;
+      } else if (resp.data && Array.isArray((resp.data as any).data)) {
+        tokenList = (resp.data as any).data;
+      }
+
+      for (const t of tokenList) {
+        // Deduplicate
+        if (this.seenTokens.has(t.contract_address)) continue;
+        this.seenTokens.add(t.contract_address);
+
+        // Filter: Created very recently? (e.g. last 24 hours)
+        const createdAt = new Date(t.created_at).getTime();
+        const ageHours = (Date.now() - createdAt) / (1000 * 60 * 60);
+
+        // Only look at stuff from last 24h
+        if (ageHours > 24) continue;
+
+        newTokens.push({
+          address: t.contract_address,
+          symbol: t.symbol,
+          source: 'clanker'
+        });
+      }
+
+      return newTokens;
+
+    } catch (e: any) {
+      console.error('[Clanker] API Error:', e.message);
+      return [];
+    }
+  }
+}
+
+// ----------------------
 // Telegram Notifier
 // ----------------------
 
@@ -271,6 +348,7 @@ class TelegramNotifier {
 async function main() {
   const wallet = new VincentWallet();
   const githubScanner = new GitHubScanner();
+  const clankerScanner = new ClankerScanner();
   const marketScanner = new MarketScanner();
   const telegram = new TelegramNotifier();
 
@@ -288,12 +366,27 @@ async function main() {
     process.exit(1);
   }
 
+  // 1a. Scan Clanker (Newest Tokens)
+  console.log('Scanning Clanker for new launches...');
+  const clankerTokens = await clankerScanner.getNewTokens();
+  console.log(`Found ${clankerTokens.length} fresh Clanker tokens.`);
+  
+  // Alert for Clanker Tokens
+  for (const t of clankerTokens) {
+    await telegram.sendMessage(
+      `🆕 *Clanker Launch*\n` +
+      `Token: ${t.symbol}\n` +
+      `Source: Clanker API\n` + 
+      `Address: \`${t.address}\``
+    );
+  }
+
   // 2. Scan GitHub for Trending Repos
   console.log('Scanning trending GitHub repos...');
   const repos = await githubScanner.getTrendingRepos();
-  console.log(`Found ${repos.length} potential repos.`);
+  console.log(`Found ${repos.length} potential GitHub repos.`);
 
-  const tokensToBuy: Token[] = [];
+  const tokensToBuy: Token[] = [...clankerTokens]; // Start with Clanker picks
 
   for (const repo of repos) {
     console.log(`Checking market for repo: ${repo.name}...`);
@@ -338,11 +431,12 @@ async function main() {
       const tokenInfo: Token = {
         address: bestPair.baseToken.address,
         symbol: bestPair.baseToken.symbol,
-        repo: repo.name
+        repo: repo.name,
+        source: 'github'
       };
 
       await telegram.sendMessage(
-        `🔍 *Opportunity Found*\n` +
+        `🔍 *GitHub Opportunity*\n` +
         `Repo: [${repo.name}](${repo.html_url})\n` +
         `Token: ${tokenInfo.symbol}\n` +
         `Liquidity: $${bestPair.liquidity?.usd?.toLocaleString() || 'Unknown'}\n` + 
@@ -368,7 +462,7 @@ async function main() {
   console.log(`\nAttempting to buy ${tokensToBuy.length} tokens...`);
   
   for (const token of tokensToBuy) {
-    console.log(`Buying 0.0001 ETH of ${token.symbol} (${token.repo})...`);
+    console.log(`Buying 0.0001 ETH of ${token.symbol} (${token.source})...`);
     
     // Attempt the swap via Vincent Wallet
     const result = await wallet.swap(token.address, 0.0001); // excessive caution: very small test amount
@@ -377,6 +471,7 @@ async function main() {
       await telegram.sendMessage(
         `💸 *Buy Executed (${isDryRun ? 'SIMULATED' : 'LIVE'})*\n` +
         `Token: ${token.symbol}\n` +
+        `Source: ${token.source}\n` +
         `Amount: 0.0001 ETH\n` +
         `Status: ${isDryRun ? 'Simulated' : 'Submitted'}`
       );
